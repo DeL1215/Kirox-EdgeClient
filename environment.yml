@@ -1,0 +1,11 @@
+name: XBOTEdge-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - libgcc-ng[version='>=12']
+  - libstdcxx-ng[version='>=12']
+  - jack
+  - libopenblas[version='>=0.3.25']
+  - numpy[version='>=1.26,<2.4']
