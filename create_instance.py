@@ -12,7 +12,7 @@ def create_instance(
     language: Optional[str] = "zh",
     output_device_index: Optional[int] = None,
     frames_per_buffer: Optional[int] = None,
-    server_url: str = "http://127.0.0.1:9600/create_instance",
+    server_url: str = "https://agent.xbotworks.com/create_instance",
     timeout: int = 10,
 ) -> Optional[Dict[str, Any]]:
     """

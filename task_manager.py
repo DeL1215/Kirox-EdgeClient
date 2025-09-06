@@ -1,18 +1,36 @@
+# task_manager.py
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
+# 串流友善：每個請求可帶回呼
+OnTextCb = Callable[[str], Awaitable[None]]
+OnChunkCb = Callable[[bytes], Awaitable[None]]
+OnFmtCb = Callable[[Dict[str, Any]], Awaitable[None]]
+OnEndCb = Callable[[], Awaitable[None]]
 
 @dataclass
 class TaskRequest:
     """
     代表一次完整的請求負載。
-    你可以把要送給 LLM 服務的必要欄位都放進來，例如:
     - kind: "audio" / "image" / ...
-    - audio_path / image_path / out_path / 其他參數
+    - payload: 實際要送給下游(send_coroutine)的資料
+    - timeout_seconds: 覆寫 TaskManager 預設逾時；None 表示使用預設
+    - on_text:         收到伺服器先行的文字訊息（AI 回覆文字）時觸發
+    - on_audio_format: 收到音訊格式宣告時觸發（例如 {"audio_format":"pcm_s16le","sample_rate":24000,"channels":1}）
+    - on_audio_chunk:  收到音訊分塊(bytes)時觸發（若提供則覆蓋預設播放器）
+    - on_stream_end:   串流結束(收到 {"done": true}) 時觸發
+    - debug:           是否輸出詳細偵錯訊息
     """
     kind: str
     payload: Dict[str, Any]
+    timeout_seconds: Optional[float] = None
+    on_text: Optional[OnTextCb] = None
+    on_audio_format: Optional[OnFmtCb] = None
+    on_audio_chunk: Optional[OnChunkCb] = None
+    on_stream_end: Optional[OnEndCb] = None
+    debug: bool = False
 
 
 class TaskManager:
@@ -21,7 +39,7 @@ class TaskManager:
     - 同時間只允許「一個」請求在飛行（in-flight）。
     - 當 in-flight 時，任何 try_start() 呼叫都會被拒絕並回傳 False。
     - 透過注入的 send_coroutine 執行實際傳輸（與 LLM 溝通）。
-    - 可設定超時、完成/失敗回呼。
+    - 可設定全域逾時、完成/失敗回呼；亦支援 TaskRequest 層級覆寫逾時與串流回呼。
     """
 
     def __init__(
@@ -32,30 +50,18 @@ class TaskManager:
         on_done: Optional[Callable[[TaskRequest, Dict[str, Any]], Awaitable[None]]] = None,
         on_error: Optional[Callable[[TaskRequest, Exception], Awaitable[None]]] = None,
     ) -> None:
-        """
-        :param send_coroutine: 真正執行「送出請求」的 async 函式。
-                               需自行完成 WebSocket 傳送/接收與落地檔案等。
-                               回傳結果資料 dict（可自定格式）。
-        :param timeout_seconds: 單次請求的逾時秒數。
-        :param on_done: 當請求成功完成時的 async 回呼。
-        :param on_error: 當請求發生例外或逾時時的 async 回呼。
-        """
         self._send = send_coroutine
         self._timeout = timeout_seconds
         self._on_done = on_done
         self._on_error = on_error
 
-        # 互斥控制旗標與鎖
         self._busy_flag: bool = False
         self._lock = asyncio.Lock()
-
-        # 目前在飛行的工作（方便外部取消或觀察）
         self._current_task: Optional[asyncio.Task] = None
         self._current_req: Optional[TaskRequest] = None
 
     @property
     def is_busy(self) -> bool:
-        """對外查詢目前是否在飛行。"""
         return self._busy_flag
 
     async def try_start(self, request: TaskRequest) -> bool:
@@ -66,26 +72,34 @@ class TaskManager:
         """
         async with self._lock:
             if self._busy_flag:
+                if request.debug:
+                    print("[TaskManager] busy=True，拒絕新請求")
                 return False
             self._busy_flag = True
             self._current_req = request
             self._current_task = asyncio.create_task(self._run(request))
+            if request.debug:
+                print("[TaskManager] 接受新請求，開始背景執行")
             return True
 
     async def _run(self, request: TaskRequest) -> None:
-        """
-        內部執行：套用逾時、呼叫 send_coroutine，並在完成/錯誤時呼叫回呼。
-        最後務必清除 busy 狀態。
-        """
+        started_at = time.time()
+        timeout = request.timeout_seconds if request.timeout_seconds is not None else self._timeout
+        if request.debug:
+            print(f"[TaskManager] _run() start, timeout={timeout}s, kind={request.kind}")
+
         try:
-            result = await asyncio.wait_for(self._send(request), timeout=self._timeout)
+            result = await asyncio.wait_for(self._send(request), timeout=timeout)
+            if request.debug:
+                print(f"[TaskManager] _run() done in {time.time()-started_at:.3f}s")
             if self._on_done:
                 try:
                     await self._on_done(request, result)
                 except Exception as cb_err:
-                    # 回呼錯誤不應該影響主流程
                     print(f"[TaskManager] on_done callback error: {cb_err}")
         except Exception as e:
+            if request.debug:
+                print(f"[TaskManager] _run() exception after {time.time()-started_at:.3f}s -> {e}")
             if self._on_error:
                 try:
                     await self._on_error(request, e)
@@ -96,12 +110,10 @@ class TaskManager:
                 self._busy_flag = False
                 self._current_task = None
                 self._current_req = None
+            if request.debug:
+                print("[TaskManager] 狀態已清空，允許下一筆請求")
 
     async def cancel_inflight(self) -> bool:
-        """
-        取消當前在飛行的請求（如果有）。
-        :return: 若成功送出取消動作回 True，否則 False。
-        """
         async with self._lock:
             if not self._current_task or self._current_task.done():
                 return False
@@ -109,7 +121,6 @@ class TaskManager:
             return True
 
     async def wait_idle(self) -> None:
-        """等待目前在飛行的請求完成（或沒有在飛行）。"""
         while True:
             async with self._lock:
                 if not self._busy_flag:
@@ -121,29 +132,3 @@ class TaskManager:
                 except Exception:
                     pass
             await asyncio.sleep(0.01)
-
-
-# =========================
-# 範例：如何把你現有的 WebSocket 流程接進來
-# =========================
-# 你可以在你的主程式中這樣使用：
-#
-# async def send_to_llm(req: TaskRequest) -> Dict[str, Any]:
-#     # 這裡放你的 WebSocket 傳送/接收與落地音訊檔邏輯
-#     # 例如:
-#     # - 若 req.kind == "audio": 使用 req.payload["audio_path"], req.payload["out_path"], uri等資訊
-#     # - 連線 ws、先發音訊 bytes -> 發 {"end": true} -> 收第一段 JSON -> 解析 -> 串流收 bytes 落地
-#     # - 回傳 dict 給 TaskManager（可包含 parsed 結果、輸出檔案路徑等）
-#     # return {"parsed": {...}, "audio_file": "...", "raw_first_text": "..."}
-#     raise NotImplementedError
-#
-# async def on_done(req: TaskRequest, res: Dict[str, Any]) -> None:
-#     print(f"[DONE] kind={req.kind} payload={req.payload} result={res}")
-#
-# async def on_error(req: TaskRequest, err: Exception) -> None:
-#     print(f"[ERR] kind={req.kind} payload={req.payload} error={err}")
-#
-# tm = TaskManager(send_to_llm, timeout_seconds=120.0, on_done=on_done, on_error=on_error)
-# ok = await tm.try_start(TaskRequest(kind="audio", payload={"audio_path": "...", "out_path": "..."}))
-# if not ok:
-#     print("忙碌中，本次觸發被丟棄")
