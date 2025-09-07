@@ -80,7 +80,7 @@ VOICE_NAME   = "Jay"
 TTS_LANG     = "zh"
 
 # 一鍵開關：保存錄音與 TTS 檔案（True=全部保存；False=全部不保存）
-SAVE_OUTPUTS = True  # 先開啟，方便你用 aplay 驗證輸出檔案內容
+SAVE_OUTPUTS = False  # 先開啟，方便你用 aplay 驗證輸出檔案內容
 
 # 錄音/VAD
 FRAME_MS               = 32
