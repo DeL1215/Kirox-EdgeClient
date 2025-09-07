@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import time
 import wave
@@ -13,8 +10,8 @@ from typing import Optional, Tuple, List
 
 import numpy as np
 import sounddevice as sd
-import webrtcvad
 import asyncio
+import torch  # ← 取代 webrtcvad，改用 Silero VAD
 
 from task_manager import TaskRequest, TaskManager
 
@@ -137,12 +134,14 @@ def _resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return np.clip(np.rint(y), -32768, 32767).astype(np.int16)
 
 
-# ====== VAD + 錄音主類別 ======
+# ====== VAD + 錄音主類別（Silero 版本） ======
 
 class VADMicStreamer:
     """
-    Linux 上自動抓『可用輸入裝置（麥克風）』，支援手動指定 input_device_name / input_device_index。
-    播放期間以 playback_guard 暫停偵測並清空佇列，避免自我回錄。
+    以 Silero VAD 取代 webrtcvad，仍保持與原版 class/參數相容。
+    特性：
+      - 對「人聲」更敏感，較不會被環境雜音誤觸發
+      - 支援啟動/結束不同門檻（hysteresis），配合連續幀數更穩定
     """
     def __init__(
         self,
@@ -150,20 +149,24 @@ class VADMicStreamer:
         loop: asyncio.AbstractEventLoop,
         outputs_dir: str = "outputs",
         uri: str = "wss://agent.xbotworks.com/ws",
-        vad_aggressiveness: int = 2,
-        frame_ms: int = 20,
-        start_trigger_frames: int = 5,
-        end_trigger_frames: int = 25,
+        # ↓↓↓ 這些參數保留相容，但內部改以 Silero 概念處理 ↓↓↓
+        vad_aggressiveness: int = 2,  # 無實質影響（保留參數以相容）
+        frame_ms: int = 30,           # 建議 30ms，Silero 在 20~30ms 表現穩定
+        start_trigger_frames: int = 3,
+        end_trigger_frames: int = 12,
         max_segment_sec: float = 15.0,
         mic_keyword: Optional[str] = None,
         fallback_device: Optional[int] = None,
-        target_proc_rate: int = 16000,
-        rms_threshold: int = 500,
+        target_proc_rate: int = 16000,   # Silero 模型建議 16k
+        rms_threshold: int = 500,        # 先做能量門檻，濾掉底噪
         botid: Optional[str] = None,
         source_mode: str = "input",
         input_device_name: Optional[str] = None,
         input_device_index: Optional[int] = None,
         playback_guard: Optional[threading.Event] = None,
+        # Silero 門檻（機率，0~1）：建議 start > end，形成遲滯
+        start_prob: float = 0.60,
+        end_prob: float = 0.35,
     ) -> None:
         self.tm = task_manager
         self.loop = loop
@@ -174,9 +177,26 @@ class VADMicStreamer:
         self.source_mode = source_mode
         self.playback_guard = playback_guard or threading.Event()
 
-        self.vad = webrtcvad.Vad(vad_aggressiveness)
-        self.frame_ms = frame_ms
+        # ========== Silero VAD 初始化 ==========
+        # 會自動下載並快取；CPU 即可滿足即時需求
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.silero_model, self._silero_utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            trust_repo=True
+        )
+        self.silero_model.eval().to(self.device)
+        # utils: (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks)
+        self.start_prob = float(start_prob)
+        self.end_prob = float(end_prob)
+        self.frame_ms = int(frame_ms)
         self.proc_frame_samples = int(self.proc_rate * self.frame_ms / 1000)
+        # Silero 要求：每次送入的 chunk 長度 >= sr / 31.25
+        self._silero_min_samples = int(np.ceil(self.proc_rate / 31.25))  # 16k → 512
+        if self.proc_frame_samples < self._silero_min_samples:
+            self.proc_frame_samples = self._silero_min_samples
+            self.frame_ms = int(round(1000 * self.proc_frame_samples / self.proc_rate))
+
         self.start_trigger_frames = start_trigger_frames
         self.end_trigger_frames = end_trigger_frames
         self.max_segment_sec = max_segment_sec
@@ -283,6 +303,8 @@ class VADMicStreamer:
         except Exception:
             print("[Audio] Could not list devices.")
         print(f"[Audio] Selected input device: {self.input_device}, samplerate={self.input_rate}, target_proc_rate={self.proc_rate}, channels={self.channels}, kind={self.kind}")
+        print(f"[Audio] VAD frame_ms={self.frame_ms}  frame_samples={self.proc_frame_samples}  (silero_min={self._silero_min_samples})")
+
 
     def _open_stream_with_fallback(self):
         trial_rates = [self.input_rate, 48000, 44100, 32000, 16000, 8000]
@@ -343,6 +365,10 @@ class VADMicStreamer:
         ts = time.strftime("%Y%m%d_%H%M%S")
         return os.path.join(self.outputs_dir, f"seg_{ts}_{int(time.time()*1000)%100000}.wav")
 
+    def _int16_to_float(self, x_int16: np.ndarray) -> np.ndarray:
+        # 轉為 [-1, 1] 的 float32，Silero 輸入格式
+        return (x_int16.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
+
     def _run(self) -> None:
         stream = self._open_stream_with_fallback()
         try:
@@ -372,7 +398,7 @@ class VADMicStreamer:
                 except queue.Empty:
                     continue
 
-                # 轉為 VAD 處理採樣率
+                # 轉為 VAD 處理採樣率（int16）
                 chunk_proc = _resample_linear(chunk_in, self.input_rate, self.proc_rate)
 
                 if self._proc_buf.size > 0:
@@ -381,30 +407,37 @@ class VADMicStreamer:
 
                 offset = 0
                 while offset + self.proc_frame_samples <= len(chunk_proc):
-                    frame = chunk_proc[offset:offset + self.proc_frame_samples]
+                    frame_i16 = chunk_proc[offset:offset + self.proc_frame_samples]
                     offset += self.proc_frame_samples
 
-                    # RMS 過濾（能量太小視為靜音）
-                    rms = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
+                    # 先做 RMS 能量過濾（int16），可迅速排除底噪
+                    rms = np.sqrt(np.mean(frame_i16.astype(np.float32) ** 2))
                     if rms < self.rms_threshold:
-                        is_speech = False
+                        speech_prob = 0.0
                     else:
-                        is_speech = self.vad.is_speech(frame.tobytes(), sample_rate=self.proc_rate)
+                        # Silero：把 int16 → float32 [-1,1]，再丟進模型得出人聲機率
+                        frame_f32 = self._int16_to_float(frame_i16)
+                        with torch.no_grad():
+                            tens = torch.from_numpy(frame_f32).to(self.device)
+                            speech_prob = float(self.silero_model(tens, self.proc_rate).item())
+
+                    # 遲滯判定：start_prob / end_prob + 連續幀數
+                    is_speech = speech_prob >= (self.start_prob if not in_speech else self.end_prob)
 
                     if not in_speech:
                         if is_speech:
                             voiced_count += 1
                             if voiced_count >= self.start_trigger_frames:
                                 in_speech = True
-                                seg_samples = [frame.copy()]
+                                seg_samples = [frame_i16.copy()]
                                 seg_start_t = time.time()
                                 unvoiced_count = 0
                                 voiced_count = 0
-                                print(f"[VAD] ▶ start (sr={self.proc_rate}, frame_ms={self.frame_ms})")
+                                print(f"[VAD] ▶ start (sr={self.proc_rate}, frame_ms={self.frame_ms}, p≈{speech_prob:.2f})")
                         else:
                             voiced_count = 0
                     else:
-                        seg_samples.append(frame.copy())
+                        seg_samples.append(frame_i16.copy())
                         if is_speech:
                             unvoiced_count = 0
                         else:
