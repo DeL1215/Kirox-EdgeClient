@@ -7,7 +7,7 @@ import os
 import re
 import time
 import wave
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import websockets
@@ -128,7 +128,7 @@ def parse_llm_output(output_text: str) -> Dict[str, Optional[str]]:
     """嘗試把回覆中的 JSON 區塊剖析出來。失敗則回空欄位。"""
     try:
         data = json.loads(output_text)
-        return {"Message": data.get("Message"), "Tool": data.get("Tool"), "Action": data.get("Action")}
+        return {"Message": data.get("Message"), "Tool": data.get("Tool")}
     except json.JSONDecodeError:
         pass
     try:
@@ -136,9 +136,9 @@ def parse_llm_output(output_text: str) -> Dict[str, Optional[str]]:
         if not m:
             raise ValueError("找不到 JSON 區塊")
         data = json.loads(m.group(0))
-        return {"Message": data.get("Message"), "Tool": data.get("Tool"), "Action": data.get("Action")}
+        return {"Message": data.get("Message"), "Tool": data.get("Tool")}
     except Exception:
-        return {"Message": None, "Tool": None, "Action": None}
+        return {"Message": None, "Tool": None}
 
 
 # ==========================================
@@ -406,6 +406,7 @@ async def send_audio_to_llm_ws(
     out_path: str,
     ws_init: Optional[Dict[str, Any]] = None,
     *,
+    on_action=None,            # ← 新增：收到 {"action": ...} 時回呼
     on_text=None,
     on_audio_format=None,
     on_audio_chunk=None,
@@ -413,14 +414,15 @@ async def send_audio_to_llm_ws(
     debug: bool = False,
 ) -> Dict[str, Any]:
     """
-    典型時序（需配合你的 server）：
+    典型時序（新版 server）：
       1) TEXT：{"botid": ..., 可選 upsert 欄位}
       2) BINARY：上傳使用者音訊
       3) TEXT：{"end": true}
-      4) TEXT：{"text": "..."}              # 先行文字
-      5) TEXT：{"audio_format":"pcm_s16le","sample_rate":24000,"channels":1}
-      6) BINARY：音訊分塊（多包）
-      7) TEXT：{"done": true}
+      4) TEXT：{"action": ...}            # 先送動作（可能是字串或 JSON 物件）
+      5) TEXT：{"text": "..."}            # 文字回覆
+      6) TEXT：{"audio_format":"pcm_s16le","sample_rate":24000,"channels":1}
+      7) BINARY：音訊分塊（多包）
+      8) TEXT：{"done": true}
     """
     first_json = {"botid": botid}
     if ws_init:
@@ -430,8 +432,10 @@ async def send_audio_to_llm_ws(
         print(f"[client] 即將連到 {uri}")
 
     t_all0 = time.time()
-    parsed: Dict[str, Any] = {}
+    parsed_text: Dict[str, Any] = {}
     raw_first_text = ""
+    raw_action = None
+    parsed_action = None
 
     # 音訊格式（等伺服器宣告後確定）
     in_fmt: Optional[str] = None
@@ -477,7 +481,7 @@ async def send_audio_to_llm_ws(
             # --- 音訊分塊 ---
             if isinstance(msg, bytes):
                 if in_fmt is None:
-                    # 未宣告格式就來了 → 預設並警告
+                    # 未宣告格式就來了 → 預設並警告（理論上 server 會先宣告）
                     in_fmt = "pcm_s16le"
                     in_sr = 24000
                     in_ch = 1
@@ -501,7 +505,7 @@ async def send_audio_to_llm_ws(
 
                 bytes_recv_audio += len(msg)
 
-                # 若提供 on_audio_chunk，預設播放器會被覆蓋；本專案不傳入以保證能播
+                # 若提供 on_audio_chunk，預設播放器會被覆蓋；不傳則直接播放
                 if on_audio_chunk:
                     await on_audio_chunk(msg)
                 else:
@@ -526,17 +530,46 @@ async def send_audio_to_llm_ws(
                     print(f"[client] 未知文字訊息：{s[:120]}...")
                 continue
 
-            # 先行文字
+            # 先送的 Action
+            if "action" in d:
+                raw_action = d.get("action")
+                parsed_action = None
+                # 可能是 dict 或字串
+                if isinstance(raw_action, dict):
+                    parsed_action = raw_action
+                else:
+                    try:
+                        parsed_action = json.loads(raw_action)
+                    except Exception:
+                        parsed_action = None
+
+                if debug:
+                    short = str(raw_action)[:160].replace("\n", " ")
+                    print(f"[client] action 收到：{short}")
+
+                if on_action:
+                    try:
+                        await on_action(raw_action, parsed_action)
+                    except Exception as e:
+                        if debug:
+                            print(f"[client] on_action 回呼錯誤：{e}")
+                continue
+
+            # 文字回覆
             if "text" in d:
                 raw_first_text = d.get("text") or ""
-                parsed = parse_llm_output(raw_first_text if isinstance(raw_first_text, str) else str(raw_first_text))
+                parsed_text = parse_llm_output(raw_first_text if isinstance(raw_first_text, str) else str(raw_first_text))
                 if debug:
                     s = raw_first_text if isinstance(raw_first_text, str) else str(raw_first_text)
                     s_short = s[:120].replace("\n", " ").replace("\r", " ")
-                    print(f"[client] 先行文字就緒（len={len(s)}），連線後耗時 {time.time() - t_connected:.3f}s")
+                    print(f"[client] 文字回覆就緒（len={len(s)}），連線後耗時 {time.time() - t_connected:.3f}s")
                     print(f"[CB] text(len={len(s)}): {s_short}...")
                 if on_text:
-                    await on_text(raw_first_text)
+                    try:
+                        await on_text(raw_first_text)
+                    except Exception as e:
+                        if debug:
+                            print(f"[client] on_text 回呼錯誤：{e}")
                 continue
 
             # 音訊格式宣告
@@ -545,9 +578,13 @@ async def send_audio_to_llm_ws(
                 in_sr = int(d.get("sample_rate") or 24000)
                 in_ch = int(d.get("channels") or 1)
                 if debug:
-                    print(f"[client] 收到音訊格式宣告：{d}（距離文字 0.000s）")
+                    print(f"[client] 收到音訊格式宣告：{d}")
                 if on_audio_format:
-                    await on_audio_format(d)
+                    try:
+                        await on_audio_format(d)
+                    except Exception as e:
+                        if debug:
+                            print(f"[client] on_audio_format 回呼錯誤：{e}")
 
                 # 準備播放器與寫檔器
                 try:
@@ -565,7 +602,11 @@ async def send_audio_to_llm_ws(
                 if debug:
                     print(f"[client] 收到 done=true，總耗時 {total:.3f}s；上傳 {len(data_up)} bytes，下載音訊 {bytes_recv_audio} bytes")
                 if on_stream_end:
-                    await on_stream_end()
+                    try:
+                        await on_stream_end()
+                    except Exception as e:
+                        if debug:
+                            print(f"[client] on_stream_end 回呼錯誤：{e}")
                 break
 
             if debug:
@@ -577,7 +618,13 @@ async def send_audio_to_llm_ws(
         if player:
             player.close()
 
-    return {"parsed": parsed, "raw_first_text": raw_first_text, "audio_file": out_path}
+    return {
+        "parsed": parsed_text,          # 從文字回覆解析出的 {Message, Tool}
+        "raw_first_text": raw_first_text,
+        "audio_file": out_path,
+        "action": parsed_action,        # 若 action 可解析為 JSON，這裡給 dict；否則 None
+        "raw_action": raw_action,       # 原始 action（可能是字串或 dict）
+    }
 
 
 # ==========================================
@@ -604,6 +651,7 @@ async def send_to_llm(request) -> Dict[str, Any]:
             audio_path=audio_path,
             out_path=out_path,
             ws_init=ws_init,
+            on_action=getattr(request, "on_action", None),        # ← 新增轉接
             on_text=getattr(request, "on_text", None),
             on_audio_format=getattr(request, "on_audio_format", None),
             # 不傳 on_audio_chunk 以確保 default 播放器會 feed()
@@ -613,9 +661,11 @@ async def send_to_llm(request) -> Dict[str, Any]:
 
     if kind == "image":
         return {
-            "parsed": {"Message": "Image handled (placeholder)", "Tool": None, "Action": None},
+            "parsed": {"Message": "Image handled (placeholder)", "Tool": None},
             "raw_first_text": "",
             "audio_file": payload.get("out_path", ""),
+            "action": None,
+            "raw_action": None,
         }
 
     raise ValueError(f"Unsupported request kind: {kind}")

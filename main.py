@@ -49,7 +49,7 @@ async def on_done(req: TaskRequest, res: dict) -> None:
     """任務完成回呼：印關鍵資訊；TTS 已串流播放，故不再重播整段。"""
     parsed = res.get("parsed", {})
     audio_file = res.get("audio_file", "")
-    print(f"[DONE] kind={req.kind} message={parsed.get('Message')} tool={parsed.get('Tool')} action={parsed.get('Action')}")
+    print(f"[DONE] kind={req.kind} message={parsed.get('Message')} tool={parsed.get('Tool')}")
     if audio_file and os.path.exists(audio_file):
         print(f"[DONE] TTS saved to: {audio_file}")
 
